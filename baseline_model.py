@@ -32,7 +32,7 @@ def load_data(path: str | None = None) -> pd.DataFrame:
     # Ensure chronological order within each match
     df = df.sort_values(["match_id", "set_no", "game_no", "point_no"]).reset_index(drop=True)
 
-    # Pre-point progress proxy: number of points already played in match (0,1,2,...)
+    # Pre-point progress proxy (optional; not used in the baseline features by default)
     df["point_index_in_match"] = df.groupby("match_id").cumcount()
 
     # Tiebreak indicator (in this dataset, game_no reaches 13 only for tiebreak)
@@ -119,9 +119,8 @@ def build_baseline_Xy(df: pd.DataFrame):
         "is_match_point_p1": derived["is_match_point_p1"].astype(int),
         "is_match_point_p2": derived["is_match_point_p2"].astype(int),
 
-        # Tiebreak + progress
+        # Tiebreak
         "is_tiebreak": df["is_tiebreak"].astype(int),
-        "point_index_in_match": df["point_index_in_match"].astype(int),
     })
 
     groups = df["match_id"].to_numpy()

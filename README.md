@@ -21,7 +21,7 @@ pip install pandas numpy scikit-learn xgboost matplotlib scipy
    - Score state (`p1_score`, `p2_score`), set/game counts
    - Given flags: `p1_break_pt`, `p2_break_pt`
    - Derived flags: game point, set point, match point (non-tiebreak approximation)
-   - Tiebreak indicator and points played so far in match
+   - Tiebreak indicator
 2. Performance signal: residual = `(actual outcome ∈ {0,1}) − (predicted probability)`.
 3. Flow curve: exponentially weighted moving average (EWMA) of residuals.
    - Positive flow ⇒ Player 1 outperforming baseline expectation
