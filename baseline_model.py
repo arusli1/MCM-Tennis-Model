@@ -2,7 +2,7 @@ import os
 import numpy as np
 import pandas as pd
 
-from sklearn.model_selection import GroupShuffleSplit
+from sklearn.model_selection import GroupShuffleSplit, GridSearchCV
 from sklearn.preprocessing import OneHotEncoder
 
 from scipy.sparse import csr_matrix, hstack
@@ -165,23 +165,67 @@ def train_xgb_baseline(X: pd.DataFrame, y: np.ndarray, groups: np.ndarray, exclu
     dtr = xgb.DMatrix(Xtr, label=y_tr)
     dte = xgb.DMatrix(Xte, label=y_te)
 
-    params = {
+    # Hyperparameter grid for tuning
+    param_grid = {
+        "max_depth": [3, 4, 5],
+        "eta": [0.03, 0.05, 0.07],
+        "subsample": [0.7, 0.8, 0.9],
+        "colsample_bytree": [0.7, 0.8, 0.9],
+        "min_child_weight": [3, 5, 7],
+        "lambda": [0.5, 1.0, 1.5],
+    }
+    
+    # Simple grid search: try combinations and pick best validation logloss
+    best_params = None
+    best_logloss = float('inf')
+    best_n_rounds = 0
+    
+    print("Tuning hyperparameters...")
+    # Sample key combinations (full grid too expensive)
+    param_combinations = [
+        {"max_depth": 4, "eta": 0.05, "subsample": 0.8, "colsample_bytree": 0.8, "min_child_weight": 5, "lambda": 1.0},
+        {"max_depth": 4, "eta": 0.05, "subsample": 0.8, "colsample_bytree": 0.8, "min_child_weight": 3, "lambda": 1.0},
+        {"max_depth": 5, "eta": 0.05, "subsample": 0.8, "colsample_bytree": 0.8, "min_child_weight": 5, "lambda": 1.0},
+        {"max_depth": 4, "eta": 0.03, "subsample": 0.8, "colsample_bytree": 0.8, "min_child_weight": 5, "lambda": 1.0},
+        {"max_depth": 4, "eta": 0.07, "subsample": 0.8, "colsample_bytree": 0.8, "min_child_weight": 5, "lambda": 1.0},
+        {"max_depth": 4, "eta": 0.05, "subsample": 0.7, "colsample_bytree": 0.8, "min_child_weight": 5, "lambda": 1.0},
+        {"max_depth": 4, "eta": 0.05, "subsample": 0.9, "colsample_bytree": 0.8, "min_child_weight": 5, "lambda": 1.0},
+    ]
+    
+    for params in param_combinations:
+        params_full = {
         "objective": "binary:logistic",
         "eval_metric": "logloss",
-        "max_depth": 4,
-        "eta": 0.05,
-        "subsample": 0.8,
-        "colsample_bytree": 0.8,
-        "min_child_weight": 5,
-        "lambda": 1.0,
-    }
-
+            **params
+        }
+        
+        booster_candidate = xgb.train(
+            params=params_full,
+            dtrain=dtr,
+            num_boost_round=2000,
+            evals=[(dtr, "train"), (dte, "valid")],
+            early_stopping_rounds=50,
+            verbose_eval=False,
+        )
+        
+        p_te_candidate = booster_candidate.predict(dte)
+        logloss = -np.mean(y_te * np.log(p_te_candidate + 1e-12) + (1 - y_te) * np.log(1 - p_te_candidate + 1e-12))
+        
+        if logloss < best_logloss:
+            best_logloss = logloss
+            best_params = params_full
+            best_n_rounds = booster_candidate.best_iteration + 1
+    
+    print(f"Best validation logloss: {best_logloss:.4f}")
+    print(f"Best params: max_depth={best_params['max_depth']}, eta={best_params['eta']}, subsample={best_params['subsample']}, colsample={best_params['colsample_bytree']}, min_child={best_params['min_child_weight']}, lambda={best_params['lambda']}")
+    print(f"Best n_rounds: {best_n_rounds}")
+    
+    # Train final model with best params
     booster = xgb.train(
-        params=params,
+        params=best_params,
         dtrain=dtr,
-        num_boost_round=2000,
+        num_boost_round=best_n_rounds,
         evals=[(dtr, "train"), (dte, "valid")],
-        early_stopping_rounds=50,
         verbose_eval=100,
     )
 
@@ -216,33 +260,28 @@ def ewma(residuals: np.ndarray, alpha: float = 0.10) -> np.ndarray:
     return F
 
 
-def ewma_by_set(residuals: np.ndarray, set_no: np.ndarray, alpha: float = 0.15) -> np.ndarray:
+def ewma(residuals: np.ndarray, alpha: float = 0.15) -> np.ndarray:
     """
-    EWMA of residuals that resets at each set boundary.
-    This makes performance within each set independent and more interpretable.
-    Lower alpha = smoother (less noisy).
+    Exponential Weighted Moving Average of residuals (no reset).
+    Lower alpha = smoother (less noisy), higher alpha = more responsive.
     """
     F = np.zeros_like(residuals, dtype=float)
     for i, e in enumerate(residuals):
-        # Reset if this is the start of a new set
-        if i == 0 or set_no[i] != set_no[i - 1]:
-            # Start with the residual itself (not scaled by alpha) for better visibility
-            F[i] = e
+        if i == 0:
+            F[i] = alpha * e
         else:
             F[i] = (1 - alpha) * F[i - 1] + alpha * e
     return F
 
 
-def smooth_ewma_by_set(residuals: np.ndarray, set_no: np.ndarray, alpha1: float = 0.12, alpha2: float = 0.10) -> np.ndarray:
+def rolling_mean(residuals: np.ndarray, window: int = 15) -> np.ndarray:
     """
-    Double-smoothed EWMA (EWMA of EWMA) for less noise.
-    Applies two passes of EWMA with resets at set boundaries.
+    Simple moving average of residuals over fixed window.
+    All points in window weighted equally.
     """
-    # First pass
-    F1 = ewma_by_set(residuals, set_no, alpha=alpha1)
-    # Second pass (smooths the already-smoothed values)
-    F2 = ewma_by_set(F1, set_no, alpha=alpha2)
-    return F2
+    # Ensure window is valid (positive and not larger than data)
+    window = max(1, min(int(window), len(residuals)))
+    return pd.Series(residuals).rolling(window=window, min_periods=1).mean().to_numpy()
 
 
 def cumulative_by_set(residuals: np.ndarray, set_no: np.ndarray) -> np.ndarray:
@@ -267,51 +306,68 @@ def cumulative_by_set(residuals: np.ndarray, set_no: np.ndarray) -> np.ndarray:
 
 def compute_point_weights(df_match: pd.DataFrame) -> np.ndarray:
     """
-    Compute weights for each point based on point "importance" and "quality".
+    Compute weights for each point based on point "importance", "pressure", and "quality".
     Higher weight = point matters more for performance evaluation.
     
-    Factors considered:
-    - Leverage: break points, game points, set points, match points
-    - Point quality: longer rallies, more running (when available)
-    - Point outcome quality: reduce weight for unearned points (aces, unforced errors)
-    
-    IMPORTANT: Only applies weighting when data is actually available.
-    Missing data = no adjustment (multiplies by 1.0), avoiding bias from imputation.
+    Design philosophy:
+    - Critical points (break/match points) should dominate performance evaluation
+    - Pressure situations (close scores) test mental strength more
+    - Skill contests (long rallies) better reflect true performance
+    - Unearned points (aces, errors) less informative about momentum
     
     Returns array of weights (normalized to have mean=1.0).
     """
     weights = np.ones(len(df_match), dtype=float)
     
-    # CRITICAL POINTS: These matter most for performance evaluation
-    # Break points (highest leverage)
-    if "p1_break_pt" in df_match.columns and "p2_break_pt" in df_match.columns:
-        is_break_pt = (df_match["p1_break_pt"] == 1) | (df_match["p2_break_pt"] == 1)
-        weights[is_break_pt] *= 2.0  # 2x weight for break points
-    
-    # Game points (important leverage)
-    if "is_game_point_p1" in df_match.columns and "is_game_point_p2" in df_match.columns:
-        is_game_pt = (df_match["is_game_point_p1"] == 1) | (df_match["is_game_point_p2"] == 1)
-        weights[is_game_pt] *= 1.5  # 1.5x for game points
-    
-    # Set points (very important)
-    if "is_set_point_p1" in df_match.columns and "is_set_point_p2" in df_match.columns:
-        is_set_pt = (df_match["is_set_point_p1"] == 1) | (df_match["is_set_point_p2"] == 1)
-        weights[is_set_pt] *= 2.5  # 2.5x for set points
-    
-    # Match points (most critical)
+    # 1. LEVERAGE: Critical points matter most for performance
+    # Match points (most critical - tests nerves under ultimate pressure)
     if "is_match_point_p1" in df_match.columns and "is_match_point_p2" in df_match.columns:
         is_match_pt = (df_match["is_match_point_p1"] == 1) | (df_match["is_match_point_p2"] == 1)
-        weights[is_match_pt] *= 3.0  # 3x for match points
+        weights[is_match_pt] *= 3.5  # 3.5x - highest weight
     
+    # Set points (winning/losing a set is huge momentum swing)
+    if "is_set_point_p1" in df_match.columns and "is_set_point_p2" in df_match.columns:
+        is_set_pt = (df_match["is_set_point_p1"] == 1) | (df_match["is_set_point_p2"] == 1)
+        weights[is_set_pt] *= 2.8  # 2.8x - very important
+    
+    # Break points (game-changing opportunities)
+    if "p1_break_pt" in df_match.columns and "p2_break_pt" in df_match.columns:
+        is_break_pt = (df_match["p1_break_pt"] == 1) | (df_match["p2_break_pt"] == 1)
+        weights[is_break_pt] *= 2.2  # 2.2x - high leverage
+    
+    # Game points (standard leverage)
+    if "is_game_point_p1" in df_match.columns and "is_game_point_p2" in df_match.columns:
+        is_game_pt = (df_match["is_game_point_p1"] == 1) | (df_match["is_game_point_p2"] == 1)
+        weights[is_game_pt] *= 1.4  # 1.4x - moderate importance
+    
+    # 2. PRESSURE: Close scores test mental strength and focus
+    # Deuce/advantage situations are more pressure than 40-0
+    if "p1_score" in df_match.columns and "p2_score" in df_match.columns:
+        s1 = df_match["p1_score"].astype(str).str.upper()
+        s2 = df_match["p2_score"].astype(str).str.upper()
+        
+        # Deuce (40-40): highest pressure
+        is_deuce = (s1 == "40") & (s2 == "40")
+        weights[is_deuce] *= 1.3
+        
+        # Advantage situations: high pressure
+        is_advantage = (s1 == "AD") | (s2 == "AD")
+        weights[is_advantage] *= 1.25
+        
+        # Close scores (30-30, 30-40, 40-30): moderate pressure
+        is_close = ((s1 == "30") & (s2 == "30")) | ((s1 == "30") & (s2 == "40")) | ((s1 == "40") & (s2 == "30"))
+        weights[is_close] *= 1.1
+    
+    # 3. QUALITY: Longer rallies and more effort = better test of skill
     # Rally length: longer rallies = more skill contest = higher weight
     # Only weight points where rally_count data is actually available
     if "rally_count" in df_match.columns:
         rally = df_match["rally_count"].astype(float)
         has_rally_data = ~rally.isna()
         rally_valid = rally[has_rally_data].clip(lower=1.0)  # Ensure >= 1
-        # Log scale: rally of 1→1.0, 5→1.3, 10→1.5, 20→1.7 weight
+        # Log scale: rally of 1→1.0, 5→1.25, 10→1.4, 20→1.6 weight
         rally_adjustment = np.maximum(rally_valid - 1, 0)
-        rally_weights = 1.0 + 0.3 * np.log1p(rally_adjustment)
+        rally_weights = 1.0 + 0.25 * np.log1p(rally_adjustment)
         # Only apply to points with valid data
         weights[has_rally_data] *= rally_weights.values
     
@@ -323,23 +379,24 @@ def compute_point_weights(df_match: pd.DataFrame) -> np.ndarray:
         has_dist_data = ~(dist1.isna() | dist2.isna())
         total_dist = (dist1 + dist2)[has_dist_data]
         total_dist = total_dist.clip(lower=0.0, upper=200.0)  # Clip to reasonable range
-        # Scale: 0m→1.0, 50m→1.2, 100m→1.4 weight
-        dist_weights = 1.0 + 0.4 * (total_dist / 100.0).clip(0, 1.5)
+        # Scale: 0m→1.0, 50m→1.15, 100m→1.3 weight
+        dist_weights = 1.0 + 0.3 * (total_dist / 100.0).clip(0, 1.5)
         # Only apply to points with valid data
         weights[has_dist_data] *= dist_weights.values
     
-    # Reduce weight for "easy" points (aces, unforced errors, double faults)
+    # 4. OUTCOME QUALITY: Reduce weight for unearned points
+    # These tell us less about true performance/momentum
     if "p1_ace" in df_match.columns and "p2_ace" in df_match.columns:
         is_ace = (df_match["p1_ace"] == 1) | (df_match["p2_ace"] == 1)
-        weights[is_ace] *= 0.5  # Ace = less skill contest
-    
-    if "p1_unf_err" in df_match.columns and "p2_unf_err" in df_match.columns:
-        is_ue = (df_match["p1_unf_err"] == 1) | (df_match["p2_unf_err"] == 1)
-        weights[is_ue] *= 0.7  # Unforced error = point given away
+        weights[is_ace] *= 0.45  # Ace = minimal skill contest, mostly server skill
     
     if "p1_double_fault" in df_match.columns and "p2_double_fault" in df_match.columns:
         is_df = (df_match["p1_double_fault"] == 1) | (df_match["p2_double_fault"] == 1)
-        weights[is_df] *= 0.6  # Double fault = unearned point
+        weights[is_df] *= 0.55  # Double fault = unearned point, mostly unforced error
+    
+    if "p1_unf_err" in df_match.columns and "p2_unf_err" in df_match.columns:
+        is_ue = (df_match["p1_unf_err"] == 1) | (df_match["p2_unf_err"] == 1)
+        weights[is_ue] *= 0.65  # Unforced error = point given away, less informative
     
     # Handle any NaN or Inf values before normalization
     weights = np.nan_to_num(weights, nan=1.0, posinf=1.0, neginf=1.0)
@@ -360,9 +417,6 @@ def weighted_residual(residuals: np.ndarray, weights: np.ndarray) -> np.ndarray:
     return residuals * weights
 
 
-def rolling_mean(residuals: np.ndarray, window: int = 20) -> np.ndarray:
-    """Rolling mean of residuals over last N points."""
-    return pd.Series(residuals).rolling(window=window, min_periods=1).mean().to_numpy()
 
 
 # -----------------------------
@@ -457,42 +511,59 @@ def plot_match_summary(df_match: pd.DataFrame, p: np.ndarray, flow: np.ndarray |
     x = np.arange(len(df_match))
     set_no = df_match["set_no"].to_numpy()
 
-    # Compute the 3 best performance metrics
-    point_weights = compute_point_weights(df_match)
+    # Performance metric: Compare EWMA vs Rolling Mean, find best alpha
+    print("\nTesting different smoothing approaches...")
     
-    # Diagnostic: report data availability for weighting
-    print("\nPoint weighting diagnostics:")
-    if "rally_count" in df_match.columns:
-        rally_valid = (~df_match["rally_count"].isna()).sum()
-        print(f"  Rally count data: {rally_valid}/{len(df_match)} points ({100*rally_valid/len(df_match):.1f}%)")
-    if "p1_distance_run" in df_match.columns and "p2_distance_run" in df_match.columns:
-        dist_valid = (~(df_match["p1_distance_run"].isna() | df_match["p2_distance_run"].isna())).sum()
-        print(f"  Distance data: {dist_valid}/{len(df_match)} points ({100*dist_valid/len(df_match):.1f}%)")
-    print(f"  Weight range: [{point_weights.min():.3f}, {point_weights.max():.3f}], mean: {point_weights.mean():.3f}")
+    # Test different alphas for EWMA
+    alphas = [0.08, 0.10, 0.12, 0.15, 0.18, 0.20, 0.25]
+    ewma_results = {}
+    for alpha in alphas:
+        ewma_vals = ewma(residual, alpha=alpha)
+        # Use variance as measure of smoothness (lower = smoother)
+        # Also consider responsiveness (how quickly it responds to changes)
+        variance = np.var(ewma_vals)
+        # Measure lag: correlation with shifted residuals (higher = less lag)
+        if len(residual) > 1:
+            lag_measure = np.corrcoef(ewma_vals[1:], residual[:-1])[0,1] if len(ewma_vals) > 1 else 0
+        else:
+            lag_measure = 0
+        ewma_results[alpha] = {"variance": variance, "lag": lag_measure}
+        print(f"  EWMA α={alpha:.2f}: variance={variance:.4f}, lag_corr={lag_measure:.4f}")
     
-    weighted_res = weighted_residual(residual, point_weights)
+    # Test rolling mean with different windows
+    windows = [10, 15, 20, 25]
+    rolling_results = {}
+    for window in windows:
+        rolling_vals = rolling_mean(residual, window=window)
+        variance = np.var(rolling_vals)
+        if len(residual) > window:
+            lag_measure = np.corrcoef(rolling_vals[window:], residual[:-window])[0,1] if len(rolling_vals) > window else 0
+        else:
+            lag_measure = 0
+        rolling_results[window] = {"variance": variance, "lag": lag_measure}
+        print(f"  Rolling mean window={window}: variance={variance:.4f}, lag_corr={lag_measure:.4f}")
     
-    # Metric 1: Weighted EWMA (quality-adjusted, smooth, reset per set)
-    # Use double smoothing for less noise
-    flow_weighted_ewma = smooth_ewma_by_set(weighted_res, set_no, alpha1=0.12, alpha2=0.10)
+    # Choose best: balance smoothness (low variance) and responsiveness (low lag)
+    # Best alpha: minimizes variance while maintaining reasonable responsiveness
+    best_alpha = min(alphas, key=lambda a: ewma_results[a]["variance"] + 0.3 * (1 - ewma_results[a]["lag"]))
+    print(f"\nSelected EWMA α={best_alpha:.2f} (best balance of smoothness and responsiveness)")
+    print(f"  Rationale: α={best_alpha:.2f} provides half-life ~{-np.log(0.5)/np.log(1-best_alpha):.1f} points")
+    print(f"  This captures short-term momentum (2-3 games) without excessive noise")
     
-    # Metric 2: Cumulative residual (clear set-level performance)
-    flow_cumulative = cumulative_by_set(residual, set_no)
+    flow_ewma = ewma(residual, alpha=best_alpha)
     
-    # Metric 3: Rolling mean (smooth, game-level view)
-    flow_rolling = rolling_mean(residual, window=15)
+    # Clean layout: 2 plots stacked vertically - baseline + EWMA
+    fig = plt.figure(figsize=(18, 8))
+    gs = fig.add_gridspec(2, 1, hspace=0.25, left=0.06, right=0.97, top=0.94, bottom=0.08,
+                         height_ratios=[1, 1])  # Equal height
 
-    # Create clean layout: all 4 plots stacked vertically, all same size, wide format
-    fig = plt.figure(figsize=(18, 10))
-    gs = fig.add_gridspec(4, 1, hspace=0.3, left=0.06, right=0.97, top=0.96, bottom=0.06,
-                         height_ratios=[1, 1, 1, 1])  # All equal height
-
-    # Plot 1: baseline probability
+    # Plot 1: Baseline probability (XGBoost predictions)
     ax0 = fig.add_subplot(gs[0, 0])
     ax0.plot(x, p, color="#9467bd", label="Baseline P(P1 wins point)", lw=2.0)
     ax0.axhline(0.5, color="gray", lw=1.5, alpha=0.6, linestyle="--", label="Equal chance")
     ax0.set_ylabel("Probability", fontsize=12, fontweight="bold")
-    ax0.set_title(title, fontsize=13, fontweight="bold", pad=10)
+    ax0.set_xlabel("Point Index", fontsize=11)
+    ax0.set_title(title, fontsize=14, fontweight="bold", pad=12)
     ax0.legend(loc="upper right", fontsize=10, framealpha=0.9)
     ax0.grid(True, alpha=0.2, linestyle=":")
     ax0.set_ylim([0, 1])
@@ -508,63 +579,41 @@ def plot_match_summary(df_match: pd.DataFrame, p: np.ndarray, flow: np.ndarray |
         elif prev_srv == 2 and curr_srv == 1:
             ax0.axvline(i, color="#ff7f0e", lw=1.2, alpha=0.6, linestyle="--")
 
-    # Plots 2-4: 3 performance metrics (stacked vertically)
-    axes_perf = [
-        fig.add_subplot(gs[1, 0]),
-        fig.add_subplot(gs[2, 0]),
-        fig.add_subplot(gs[3, 0]),
-    ]
+    # Plot 2: Performance Flow (EWMA of residuals)
+    ax1 = fig.add_subplot(gs[1, 0])
     
-    metrics = [
-        (flow_weighted_ewma, "Weighted Momentum (quality-adjusted, double-smoothed EWMA)", "#2ca02c", 
-         "Who is playing better NOW?\nImportant points (break/match points) weighted higher."),
-        (flow_cumulative, "Set-Level Performance (cumulative residual, reset per set)", "#9467bd",
-         "Who outperformed in each set?\nPositive = P1 better, Negative = P2 better."),
-        (flow_rolling, "Sustained Trend (rolling mean, 15 points)", "#ff7f0e",
-         "Medium-term momentum (~1 game window).\nShows sustained runs across sets."),
-    ]
-
-    for ax, (metric_data, label, color, desc) in zip(axes_perf, metrics):
-        # Handle NaN/Inf values - replace with 0
-        metric_data = np.nan_to_num(metric_data, nan=0.0, posinf=0.0, neginf=0.0)
-        
-        # Debug: print metric stats
-        print(f"\n{label.split(chr(10))[0]}:")
-        print(f"  Min: {metric_data.min():.4f}, Max: {metric_data.max():.4f}, Mean: {metric_data.mean():.4f}, Std: {metric_data.std():.4f}")
-        
-        ax.plot(x, metric_data, color=color, lw=2.0, alpha=0.9, label=label.split("\n")[0])
-        ax.axhline(0, color="gray", lw=1.5, alpha=0.6, linestyle="--")
-        ax.fill_between(x, 0, metric_data, where=(metric_data >= 0), color=color, alpha=0.25)
-        ax.fill_between(x, 0, metric_data, where=(metric_data < 0), color="#d62728", alpha=0.25)
-        ax.set_ylabel("Performance", fontsize=11, fontweight="bold")
-        ax.set_title(label, fontsize=11, fontweight="bold", pad=6)
-        ax.grid(True, alpha=0.25, linestyle=":")
-        ax.tick_params(labelsize=9)
-        ax.legend(loc="upper right", fontsize=9, framealpha=0.9)
-        
-        # Ensure axis auto-scales properly and includes 0, handle NaN/Inf
-        y_min, y_max = float(metric_data.min()), float(metric_data.max())
-        if not (np.isfinite(y_min) and np.isfinite(y_max)):
-            # Fallback if still NaN/Inf
-            y_min, y_max = -0.1, 0.1
-        
-        y_range = y_max - y_min
-        if y_range < 0.01 or not np.isfinite(y_range):  # If values are very small or invalid
-            y_center = (y_max + y_min) / 2 if np.isfinite((y_max + y_min) / 2) else 0.0
-            ax.set_ylim(y_center - 0.1, y_center + 0.1)
-        else:
-            ax.set_ylim(y_min - 0.1 * y_range, y_max + 0.1 * y_range)
-        
-        for i in np.where(set_change)[0]:
-            ax.axvline(i, color="black", lw=1.5, alpha=0.5)
-        
-        # Only add xlabel to bottom plot
-        if ax == axes_perf[-1]:
-            ax.set_xlabel("Point index", fontsize=10)
-        
-        # Add text annotation with description
-        ax.text(0.02, 0.98, desc, transform=ax.transAxes, fontsize=8,
-                verticalalignment="top", bbox=dict(boxstyle="round,pad=0.5", facecolor="wheat", alpha=0.3))
+    # Handle NaN/Inf values
+    flow_ewma = np.nan_to_num(flow_ewma, nan=0.0, posinf=0.0, neginf=0.0)
+    
+    ax1.plot(x, flow_ewma, color="#2ca02c", label=f"Performance Flow (EWMA, α={best_alpha:.2f})", lw=2.0, alpha=0.9)
+    ax1.axhline(0, color="gray", lw=1.5, alpha=0.6, linestyle="--")
+    ax1.fill_between(x, 0, flow_ewma, where=(flow_ewma >= 0), color="#2ca02c", alpha=0.25)
+    ax1.fill_between(x, 0, flow_ewma, where=(flow_ewma < 0), color="#d62728", alpha=0.25)
+    ax1.set_ylabel("Performance Flow", fontsize=12, fontweight="bold")
+    ax1.set_title("Performance Flow (EWMA of Residuals)", fontsize=14, fontweight="bold", pad=12)
+    ax1.legend(loc="upper right", fontsize=10, framealpha=0.9)
+    ax1.grid(True, alpha=0.2, linestyle=":")
+    ax1.tick_params(labelsize=10)
+    
+    # Auto-scale y-axis
+    y_min, y_max = float(flow_ewma.min()), float(flow_ewma.max())
+    if not (np.isfinite(y_min) and np.isfinite(y_max)):
+        y_min, y_max = -0.1, 0.1
+    
+    y_range = y_max - y_min
+    if y_range < 0.01 or not np.isfinite(y_range):
+        y_center = (y_max + y_min) / 2 if np.isfinite((y_max + y_min) / 2) else 0.0
+        ax1.set_ylim(y_center - 0.1, y_center + 0.1)
+    else:
+        ax1.set_ylim(y_min - 0.1 * y_range, y_max + 0.1 * y_range)
+    
+    # Set boundaries
+    for i in np.where(game_change)[0]:
+        ax1.axvline(i, color="lightgray", lw=0.5, alpha=0.3)
+    for i in np.where(set_change)[0]:
+        ax1.axvline(i, color="black", lw=1.5, alpha=0.5)
+    
+    ax1.set_xlabel("Point Index", fontsize=11)
 
     # Save figure
     results_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results")
@@ -645,15 +694,9 @@ if __name__ == "__main__":
     print(f"\nTraining baseline model (excluding match '{target_match_id}')...")
     booster, enc, num_cols, cat_cols = train_xgb_baseline(X, y, groups, exclude_match_id=target_match_id)
 
-    # Extract target match for evaluation
+    # Extract target match for visualization
     mask = (df["match_id"] == target_match_id)
     df_m = df.loc[mask].copy()
-    
-    # Add derived flags for point weighting
-    flags = derive_point_flags(df_m)
-    for col in flags.columns:
-        df_m[col] = flags[col]
-    
     X_m = X.loc[mask].copy()
     y_m = y[mask]
 
@@ -661,10 +704,17 @@ if __name__ == "__main__":
     p_m = predict_proba(booster, enc, num_cols, cat_cols, X_m)
     residual_m = y_m - p_m
     
-    # Compute match-level performance summary
+    # Match-level performance summary
     match_logloss = -np.mean(y_m * np.log(p_m + 1e-12) + (1 - y_m) * np.log(1 - p_m + 1e-12))
-    print(f"Match logloss: {match_logloss:.4f}")
-    print(f"Mean absolute residual: {np.abs(residual_m).mean():.4f}")
+    print(f"\nMatch Evaluation:")
+    print(f"  Match logloss: {match_logloss:.4f}")
+    print(f"  Mean absolute residual: {np.abs(residual_m).mean():.4f}")
+    
+    # Summary statistics
+    p1_advantage_points = np.sum(residual_m > 0)
+    p2_advantage_points = np.sum(residual_m < 0)
+    print(f"  Points where P1 outperformed: {p1_advantage_points} ({100*p1_advantage_points/len(residual_m):.1f}%)")
+    print(f"  Points where P2 outperformed: {p2_advantage_points} ({100*p2_advantage_points/len(residual_m):.1f}%)")
 
     title = f"Match Flow — {df_m['player1'].iloc[0]} vs {df_m['player2'].iloc[0]}"
     plot_match_summary(df_m, p_m, None, residual_m, title=title)
